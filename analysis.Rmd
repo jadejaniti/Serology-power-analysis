@@ -1,0 +1,317 @@
+---
+title: "Serology data QC, seroprevalence, and power analysis"
+subtitle: "Parvovirus B19 IgG serosurvey, Belgium (n = 3,080)"
+author: "Niti B. Jadeja, Ph.D."
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.2, dpi = 120,
+                      fig.path = "figures/")
+library(ggplot2)
+library(pwr)
+library(mixtools)
+library(splines)
+theme_set(theme_minimal(base_size = 12))
+set.seed(2026)
+```
+
+# Purpose
+
+This project works through the analyses a laboratory data analyst runs on serology data, using a real, public serosurvey:
+
+1. **Data QC**: completeness, range checks, and agreement between the quantitative antibody result and the qualitative positive/negative call.
+2. **Assay cutoff check**: an independent, data-driven cutoff from a two-component mixture model, compared with the reported calls.
+3. **Seroprevalence**: estimates by age group with 95% confidence intervals, and a logistic regression of seropositivity on age and sex.
+4. **Study design and power**: sample size for precise seroprevalence estimates, power for comparing two groups, and simulation-based power for a planned age-adjusted serosurvey.
+
+**Data.** Parvovirus B19 IgG antibody concentrations (IU/mL) and serostatus for 3,080 residual sera from a Belgian national serum bank, line-listed in the open-source R package *serosv* (MIT license). Original study: Mossong J, Hens N, et al. *Parvovirus B19 infection in five European countries: seroepidemiology, force of infection and maternal risk of infection.* Epidemiology and Infection 136(8):1059–68 (2008). doi:10.1017/S0950268807009661.
+
+```{r load}
+d <- read.csv("data/parvob19_be_serology.csv")
+d$gender <- factor(d$gender, levels = c("f", "m"), labels = c("Female", "Male"))
+str(d)
+```
+
+# Data quality control
+
+## Completeness and ranges
+
+```{r completeness}
+qc <- data.frame(
+  variable = names(d),
+  missing_n = sapply(d, function(x) sum(is.na(x))),
+  missing_pct = round(100 * sapply(d, function(x) mean(is.na(x))), 1)
+)
+knitr::kable(qc, row.names = FALSE, caption = "Missing values by variable")
+
+range_checks <- c(
+  age_out_of_range   = sum(d$age < 0 | d$age > 100, na.rm = TRUE),
+  conc_nonpositive   = sum(d$parvouml <= 0, na.rm = TRUE),
+  status_not_0_or_1  = sum(!d$seropositive %in% c(0, 1)),
+  duplicated_rows    = sum(duplicated(d))
+)
+knitr::kable(data.frame(check = names(range_checks), n_records = range_checks),
+             row.names = FALSE, caption = "Range and consistency checks")
+```
+
+`r sum(is.na(d$parvouml))` records (`r round(100*mean(is.na(d$parvouml)),1)`%) have a serostatus but no quantitative result. They stay in the prevalence analyses but are excluded from the cutoff analysis.
+
+## Agreement between concentration and serostatus
+
+Antibody concentrations are strongly right-skewed, so they are analyzed on the log10 scale. If the qualitative calls follow a single cutoff, the two groups should not overlap.
+
+```{r distribution, fig.cap = "Antibody concentration by reported serostatus"}
+q <- subset(d, !is.na(parvouml))
+q$status <- factor(q$seropositive, labels = c("Reported negative", "Reported positive"))
+ggplot(q, aes(log10(parvouml), fill = status)) +
+  geom_histogram(bins = 60, alpha = 0.75, position = "identity") +
+  scale_fill_manual(values = c("#7A869A", "#C2410C")) +
+  labs(x = "log10 antibody concentration (IU/mL)", y = "Number of sera", fill = NULL)
+```
+
+```{r discordant}
+min_pos <- min(q$parvouml[q$seropositive == 1])
+max_neg_below <- max(q$parvouml[q$seropositive == 0 & q$parvouml < min_pos])
+# discordant: reported negative above the lowest positive, or reported positive below the highest negative
+overlap <- subset(q, (seropositive == 0 & parvouml >= min_pos) |
+                     (seropositive == 1 & parvouml <= max_neg_below))
+c(lowest_positive = min_pos, highest_regular_negative = max_neg_below,
+  discordant_records = nrow(overlap))
+```
+
+Almost all negatives fall below `r round(max_neg_below,1)` IU/mL and all positives lie at or above `r round(min_pos,1)` IU/mL. The empty gap between them is consistent with an equivocal zone in the assay. `r nrow(overlap)` reported negatives sit above the lowest positive. They are candidates for source verification: a transcription error, a retest, or an equivocal result recorded as negative.
+
+```{r flag_table}
+flags <- overlap[order(-overlap$parvouml), c("age", "gender", "parvouml", "seropositive")]
+knitr::kable(head(flags, 10), row.names = FALSE,
+             caption = "Records whose serostatus disagrees with their concentration")
+```
+
+# Assay cutoff check with a mixture model
+
+A two-component Gaussian mixture on log10 concentration estimates the seronegative and seropositive populations without using the reported calls. The cutoff is where a serum is equally likely to belong to either component.
+
+```{r mixture}
+x <- log10(q$parvouml)
+fit <- normalmixEM(x, k = 2, mu = c(0.5, 2.2), sigma = c(0.3, 0.3), verb = FALSE)
+neg <- which.min(fit$mu); pos <- which.max(fit$mu)
+post_pos <- function(v) {
+  a <- fit$lambda[pos] * dnorm(v, fit$mu[pos], fit$sigma[pos])
+  b <- fit$lambda[neg] * dnorm(v, fit$mu[neg], fit$sigma[neg])
+  a / (a + b)
+}
+cut_log <- uniroot(function(v) post_pos(v) - 0.5, c(fit$mu[neg], fit$mu[pos]))$root
+cutoff <- 10^cut_log
+mix_tab <- data.frame(
+  component = c("Seronegative", "Seropositive"),
+  proportion = round(fit$lambda[c(neg, pos)], 3),
+  geometric_mean_IU_mL = round(10^fit$mu[c(neg, pos)], 1),
+  sd_log10 = round(fit$sigma[c(neg, pos)], 3)
+)
+knitr::kable(mix_tab, caption = "Two-component mixture model fit")
+```
+
+The mixture-model cutoff is **`r round(cutoff, 1)` IU/mL**.
+
+```{r agreement}
+q$mix_call <- as.integer(q$parvouml >= cutoff)
+tab <- table(Reported = q$seropositive, Mixture = q$mix_call)
+po <- sum(diag(tab)) / sum(tab)
+pe <- sum(rowSums(tab) * colSums(tab)) / sum(tab)^2
+kappa <- (po - pe) / (1 - pe)
+tab
+c(percent_agreement = round(100 * po, 2), cohens_kappa = round(kappa, 3))
+```
+
+```{r mixture_plot, fig.cap = "Mixture components and the derived cutoff"}
+grid <- seq(min(x), max(x), length.out = 400)
+dens <- data.frame(
+  x = rep(grid, 2),
+  y = c(fit$lambda[neg] * dnorm(grid, fit$mu[neg], fit$sigma[neg]),
+        fit$lambda[pos] * dnorm(grid, fit$mu[pos], fit$sigma[pos])),
+  component = rep(c("Seronegative", "Seropositive"), each = length(grid))
+)
+ggplot() +
+  geom_histogram(aes(x, after_stat(density)), data = data.frame(x = x),
+                 bins = 60, fill = "grey85") +
+  geom_line(aes(x, y, colour = component), data = dens, linewidth = 1) +
+  geom_vline(xintercept = cut_log, linetype = 2) +
+  scale_colour_manual(values = c("#7A869A", "#C2410C")) +
+  labs(x = "log10 antibody concentration (IU/mL)", y = "Density", colour = NULL)
+```
+
+**Interpretation.** Agreement between the data-driven cutoff and the reported calls is high (kappa = `r sprintf("%.3f", kappa)`). The only disagreements are the records flagged in Section 2, which supports reviewing those records rather than changing the cutoff.
+
+# Seroprevalence
+
+## By age group, with Wilson 95% confidence intervals
+
+```{r prevalence}
+wilson <- function(x, n, z = 1.96) {
+  p <- x / n
+  centre <- (p + z^2 / (2 * n)) / (1 + z^2 / n)
+  half <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / (1 + z^2 / n)
+  c(lower = centre - half, upper = centre + half)
+}
+d$age_group <- cut(d$age, c(-1, 5, 10, 15, 20, 30, 40, 60, 90),
+                   labels = c("0-5", "6-10", "11-15", "16-20", "21-30", "31-40", "41-60", "61+"))
+prev <- do.call(rbind, lapply(split(d, d$age_group), function(g) {
+  ci <- wilson(sum(g$seropositive), nrow(g))
+  data.frame(n = nrow(g), positive = sum(g$seropositive),
+             prevalence = mean(g$seropositive), lower = ci[1], upper = ci[2])
+}))
+prev$age_group <- factor(rownames(prev), levels = levels(d$age_group))
+knitr::kable(transform(prev[, c("age_group", "n", "positive")],
+                       prevalence = sprintf("%.1f%% (%.1f-%.1f)", 100 * prev$prevalence,
+                                            100 * prev$lower, 100 * prev$upper)),
+             row.names = FALSE, caption = "Seroprevalence (95% CI) by age group")
+```
+
+```{r prevalence_plot, fig.cap = "Seroprevalence by age group"}
+ggplot(prev, aes(age_group, prevalence)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), colour = "#C2410C") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Age group (years)", y = "Seroprevalence (95% CI)")
+```
+
+## Logistic regression: age and sex
+
+Seroprevalence rises steeply through childhood and then plateaus, so age enters the model as a natural cubic spline (4 degrees of freedom) rather than a straight line.
+
+```{r logistic}
+m <- glm(seropositive ~ ns(age, df = 4) + gender, family = binomial, data = d)
+or_sex <- exp(cbind(OR = coef(m), confint.default(m)))["genderMale", ]
+round(or_sex, 2)
+anova(m, test = "LRT")
+```
+
+The adjusted odds ratio for male vs female sex is `r sprintf("%.2f (95%% CI %.2f-%.2f)", or_sex[1], or_sex[2], or_sex[3])`.
+
+```{r fitted_curve, fig.cap = "Model-based seroprevalence by age and sex"}
+nd <- expand.grid(age = seq(0, 80, by = 0.5), gender = levels(d$gender))
+pr <- predict(m, nd, type = "link", se.fit = TRUE)
+nd$fit <- plogis(pr$fit); nd$lo <- plogis(pr$fit - 1.96 * pr$se.fit)
+nd$hi <- plogis(pr$fit + 1.96 * pr$se.fit)
+ggplot(nd, aes(age, fit, colour = gender, fill = gender)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_colour_manual(values = c("#1F4E79", "#C2410C")) +
+  scale_fill_manual(values = c("#1F4E79", "#C2410C")) +
+  labs(x = "Age (years)", y = "Predicted seroprevalence", colour = NULL, fill = NULL)
+```
+
+# Study design and power
+
+This section answers the planning questions an investigator would bring before a new serosurvey. Each calculation uses this survey as the pilot.
+
+## Sample size for a precise prevalence estimate
+
+The number of sera needed so that the 95% confidence interval has half-width *E*, inflated by a design effect for clustered sampling:
+
+$$n = \text{DEFF} \times \frac{z^2\,p(1-p)}{E^2}$$
+
+```{r precision}
+n_precision <- function(p, E, deff = 1, z = 1.96) ceiling(deff * z^2 * p * (1 - p) / E^2)
+ps <- c(child_0_5 = prev["0-5", "prevalence"], child_6_10 = prev["6-10", "prevalence"],
+        adult_21_30 = prev["21-30", "prevalence"])
+grid <- expand.grid(group = names(ps), E = c(0.03, 0.05, 0.10), deff = c(1, 1.5))
+grid$p <- round(ps[grid$group], 3)
+grid$n_required <- mapply(n_precision, grid$p, grid$E, grid$deff)
+knitr::kable(grid, caption = "Sera required per group for a given precision (E = CI half-width)")
+```
+
+## Power to compare seroprevalence between two groups
+
+Cohen's *h* (arcsine-transformed difference in proportions) with `pwr::pwr.2p.test`. Example question: how many sera per group to detect a 10-percentage-point difference in seroprevalence in 6–10-year-olds between two regions?
+
+```{r two_group}
+p1 <- prev["6-10", "prevalence"]
+h <- ES.h(p1 + 0.10, p1)
+n80 <- pwr.2p.test(h = h, power = 0.80, sig.level = 0.05)$n
+n90 <- pwr.2p.test(h = h, power = 0.90, sig.level = 0.05)$n
+c(baseline_prevalence = round(p1, 3), cohens_h = round(h, 3),
+  n_per_group_80pct = ceiling(n80), n_per_group_90pct = ceiling(n90))
+```
+
+```{r power_curves, fig.cap = "Power to detect a difference in seroprevalence, by sample size per group"}
+diffs <- c(0.05, 0.10, 0.15, 0.20)
+ns <- seq(50, 1500, by = 25)
+pc <- do.call(rbind, lapply(diffs, function(dd) data.frame(
+  n = ns, difference = paste0("+", 100 * dd, " points"),
+  power = pwr.2p.test(h = ES.h(p1 + dd, p1), n = ns, sig.level = 0.05)$power)))
+pc$difference <- factor(pc$difference, levels = paste0("+", 100 * diffs, " points"))
+ggplot(pc, aes(n, power, colour = difference)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = 3) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Sera per group", y = "Power (two-sided alpha = 0.05)", colour = "Difference vs baseline")
+```
+
+## How sensitive was this survey to a sex difference?
+
+A non-significant result means little without knowing the study's power. Using the observed group sizes, this is the smallest sex difference the survey could reliably detect.
+
+```{r detectable}
+nf <- sum(d$gender == "Female"); nm <- sum(d$gender == "Male")
+p_overall <- mean(d$seropositive)
+h_min <- pwr.2p2n.test(n1 = nf, n2 = nm, power = 0.80, sig.level = 0.05)$h
+# convert the detectable h back to a difference in proportions around the overall prevalence
+p_detect <- sin(asin(sqrt(p_overall)) + h_min / 2)^2
+c(n_female = nf, n_male = nm, detectable_h = round(h_min, 3),
+  detectable_difference_pct_points = round(100 * (p_detect - p_overall), 1))
+```
+
+## Simulation-based power for an age-adjusted design
+
+Closed-form formulas assume a simple two-group comparison. A real serosurvey adjusts for age, so this simulation uses the fitted age curve from Section 4 as the true baseline, adds a region effect (odds ratio 1.5), and repeats the planned analysis many times at each sample size.
+
+```{r simulation}
+sim_power <- function(n_total, or = 1.5, reps = 400) {
+  base <- glm(seropositive ~ ns(age, df = 4), family = binomial, data = d)
+  hits <- replicate(reps, {
+    s <- d[sample(nrow(d), n_total, replace = TRUE), "age", drop = FALSE]
+    s$region <- rbinom(n_total, 1, 0.5)
+    lp <- predict(base, newdata = s, type = "link") + log(or) * s$region
+    s$y <- rbinom(n_total, 1, plogis(lp))
+    fit <- glm(y ~ ns(age, df = 4) + region, family = binomial, data = s)
+    summary(fit)$coefficients["region", "Pr(>|z|)"] < 0.05
+  })
+  mean(hits)
+}
+sizes <- c(300, 500, 700, 900, 1200, 1500)
+sp <- data.frame(n_total = sizes, power = sapply(sizes, sim_power))
+sp$mc_se <- round(sqrt(sp$power * (1 - sp$power) / 400), 3)
+knitr::kable(sp, caption = "Simulated power to detect OR = 1.5 for region, adjusted for age (400 simulations each)")
+```
+
+```{r sim_plot, fig.cap = "Simulated power for an age-adjusted region comparison"}
+ggplot(sp, aes(n_total, power)) +
+  geom_line(colour = "#1F4E79", linewidth = 1) + geom_point(colour = "#1F4E79") +
+  geom_errorbar(aes(ymin = power - 1.96 * mc_se, ymax = power + 1.96 * mc_se),
+                width = 25, colour = "#1F4E79") +
+  geom_hline(yintercept = 0.8, linetype = 3) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Total sera (both regions)", y = "Power")
+```
+
+# Summary
+
+- **QC:** `r round(100*mean(is.na(d$parvouml)),1)`% of records lack a quantitative result, and `r nrow(overlap)` records have a serostatus that disagrees with their concentration; these were flagged for source verification rather than silently corrected.
+- **Cutoff:** an independent mixture-model cutoff (`r round(cutoff,1)` IU/mL) agrees closely with the reported calls (kappa `r sprintf("%.3f", kappa)`).
+- **Epidemiology:** seroprevalence rises from `r round(100*prev["0-5","prevalence"])`% at ages 0–5 to `r round(100*prev["61+","prevalence"])`% over 60; sex has no clear effect after adjusting for age (OR `r sprintf("%.2f", or_sex[1])`).
+- **Design:** detecting a 10-point difference in 6–10-year-olds needs about `r ceiling(n80)` sera per group for 80% power; an age-adjusted comparison at OR 1.5 reaches 80% power at about `r sp$n_total[which(sp$power >= 0.8)[1]]` sera in total (Section 5.4).
+
+**Limitations.** Residual sera are a convenience sample, so prevalence may not represent the general population; the simulation assumes the fitted age curve is correct and that region is independent of age.
+
+```{r session, echo = FALSE}
+sessionInfo()
+```
